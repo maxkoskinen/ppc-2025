@@ -1,0 +1,375 @@
+/*
+This is the function you need to implement. Quick reference:
+- input rows: 0 <= y < ny
+- input columns: 0 <= x < nx
+- element at row y and column x is stored in data[x + y*nx]
+- correlation between rows i and row j has to be stored in result[i + j*ny]
+- only parts with 0 <= j <= i < ny need to be filled
+*/
+
+#include <cmath>
+#include <vector>
+#include <omp.h>
+#include <x86intrin.h>
+#include <algorithm>
+#include <tuple>
+
+
+typedef double double4_t __attribute__ ((vector_size (4 * sizeof(double))));
+
+// helper functions
+inline double horizontal_sum(__m256d vec) {
+    __m128d hi = _mm256_extractf128_pd(vec, 1);
+    __m128d lo = _mm256_castpd256_pd128(vec);
+    __m128d sum1 = _mm_add_pd(hi, lo);
+    __m128d sum2 = _mm_hadd_pd(sum1, sum1);
+    return _mm_cvtsd_f64(sum2);
+}
+
+double r_mean(const float* row, int nx) {
+    __m256d sum_vec = _mm256_setzero_pd();
+    int j = 0;
+
+    for (; j + 4 <= nx; j += 4) {
+        __m128 float_vals = _mm_loadu_ps(&row[j]);
+        __m256d double_vals = _mm256_cvtps_pd(float_vals);
+        sum_vec = _mm256_add_pd(sum_vec, double_vals);
+    }
+
+    double sum = horizontal_sum(sum_vec);
+
+    // rem elements
+    for (; j < nx; ++j) {
+        sum += static_cast<double>(row[j]);
+    }
+
+    return sum / static_cast<double>(nx);
+}
+
+double r_std(const float* row, int nx, double mean) {
+    __m256d square_sum_vec = _mm256_setzero_pd();
+    const __m256d mean_vec = _mm256_set1_pd(mean);
+    int j = 0;
+
+    for (; j + 4 <= nx; j += 4) {
+        __m128 float_vals = _mm_loadu_ps(&row[j]);
+        __m256d double_vals = _mm256_cvtps_pd(float_vals);
+        __m256d diff = _mm256_sub_pd(double_vals, mean_vec);
+        square_sum_vec = _mm256_fmadd_pd(diff, diff, square_sum_vec); // diff^2 + sum
+    }
+
+    double square_sum = horizontal_sum(square_sum_vec);
+
+    // rem elements
+    for (; j < nx; ++j) {
+        double diff = static_cast<double>(row[j]) - mean;
+        square_sum += diff * diff;
+    }
+
+    return std::sqrt(square_sum);
+}
+
+static inline double4_t swap2(double4_t x) { return _mm256_permute2f128_pd(x, x, 0b00000001); }
+static inline double4_t swap1(double4_t x) { return _mm256_permute_pd(x, 0b00000101); }
+
+
+void correlate(int ny, int nx, const float *data, float *result) {
+    //std::vector<double> normalized_data(ny * nx, 0.0);
+    double* normalized_data = static_cast<double*>(_mm_malloc(sizeof(double) * ny * nx, 32));
+    int nb = 4;
+    int na = (ny + nb - 1) / nb;
+    //std::vector<double4_t> vector_data(na * nx);
+    double4_t* vector_data = static_cast<double4_t*>(_mm_malloc(sizeof(double4_t) * na * nx, 32));
+    constexpr int kBlockSize = 128;
+
+    #pragma omp parallel for schedule(static,1)
+    for (int i = 0; i < ny; ++i) {
+        double mean = r_mean(&data[i * nx], nx);
+        double stddev = r_std(&data[i * nx], nx, mean);
+
+        for (int j = 0; j < nx; ++j) {
+            normalized_data[i * nx + j] = (data[i * nx + j] - mean) / stddev;
+        }
+    }
+    
+    #pragma omp parallel for schedule(static,1)
+    for (int ja = 0; ja < na; ++ja) {
+        for (int i = 0; i < nx; ++i) {
+            for (int jb = 0; jb < nb; ++jb) {
+                int j = nb * ja + jb;
+                const int PF = 10;
+                __builtin_prefetch(&normalized_data[nx * j + i + PF]);
+                vector_data[nx * ja + i][jb] = (j < ny) ? normalized_data[nx * j + i] : 0.0;
+            }
+        }
+    }
+
+
+    #pragma omp parallel for schedule(dynamic)
+    for (int ia = 0; ia < na; ++ia) {
+        for (int ja = ia; ja < na; ++ja) {
+
+            double4_t vv[8] = {
+                {0.0, 0.0, 0.0, 0.0},
+                {0.0, 0.0, 0.0, 0.0},
+                {0.0, 0.0, 0.0, 0.0},
+                {0.0, 0.0, 0.0, 0.0},
+                {0.0, 0.0, 0.0, 0.0},
+                {0.0, 0.0, 0.0, 0.0},
+                {0.0, 0.0, 0.0, 0.0},
+                {0.0, 0.0, 0.0, 0.0}
+            };
+
+            for (int k0 = 0; k0 < nx; k0 += kBlockSize) {
+                int kend = std::min(k0 + kBlockSize, nx);
+                #pragma omp simd aligned(vector_data:32) simdlen(4)
+                for (int k = k0; k < kend; ++k) {
+                    constexpr int PF = 12;
+                    __builtin_prefetch(&vector_data[nx * ia + k + PF]);
+                    __builtin_prefetch(&vector_data[nx * ja + k + PF]);
+
+                    double4_t a = vector_data[nx * ia + k];
+                    double4_t b = vector_data[nx * ja + k];
+
+                    double4_t a_swapped = swap2(a);
+                    double4_t b_swapped = swap1(b);
+
+                    vv[0] = vv[0] + (a * b);
+                    vv[1] = vv[1] + (a * b_swapped);
+                    vv[2] = vv[2] + (a_swapped * b);
+                    vv[3] = vv[3] + (a_swapped * b_swapped);
+                    vv[4] = vv[4] + (a_swapped * b);
+                    vv[5] = vv[5] + (a_swapped * b_swapped);
+                    vv[6] = vv[6] + (a * b);
+                    vv[7] = vv[7] + (a * b_swapped);
+                }
+            }
+
+            vv[1] = swap1(vv[1]);
+            vv[3] = swap1(vv[3]);
+            vv[5] = swap1(vv[5]);
+            vv[7] = swap1(vv[7]);
+
+            for (int jb = 0; jb < nb; ++jb) {
+                for (int ib = 0; ib < nb; ++ib) {
+                    int i = ib + nb * ia;
+                    int j = jb + nb * ja;
+                    if (j < ny && i < ny && i <= j) {
+                        result[ny * i + j] = vv[ib ^ jb][jb];
+                    }
+                }
+            }
+        }
+    }
+    _mm_free(normalized_data);
+    _mm_free(vector_data);
+}
+
+
+
+
+
+
+/*
+This is the function you need to implement. Quick reference:
+- input rows: 0 <= y < ny
+- input columns: 0 <= x < x
+- element at row y and column x is stored in data[x + y*nx]
+- correlation between rows i and row j has to be stored in result[i + j*ny]
+- only parts with 0 <= j <= i < ny need to be filled
+*/
+
+#include <cmath>
+#include <vector>
+#include <omp.h>
+#include <x86intrin.h>
+#include <algorithm>
+#include <tuple>
+
+typedef double double4_t __attribute__ ((vector_size (4 * sizeof(double))));
+constexpr double4_t d4zero = {0,0,0,0};
+// helper functions
+inline double horizontal_sum(double4_t vec) {
+    return vec[0] + vec[1] + vec[2] + vec[3];
+}
+
+double r_mean(const float* row, int nx) {
+    double4_t sum_vec = {0.0, 0.0, 0.0, 0.0};
+    int j = 0;
+    for (; j + 4 <= nx; j += 4) {
+        double4_t vals = {static_cast<double>(row[j]), static_cast<double>(row[j+1]),
+                          static_cast<double>(row[j+2]), static_cast<double>(row[j+3])};
+        sum_vec += vals;
+    }
+    double sum = horizontal_sum(sum_vec);
+    for (; j < nx; ++j) {
+        sum += static_cast<double>(row[j]);
+    }
+    return sum / static_cast<double>(nx);
+}
+
+double r_std(const float* row, int nx, double mean) {
+    double4_t square_sum_vec = {0.0, 0.0, 0.0, 0.0};
+    double4_t mean_vec = {mean, mean, mean, mean};
+    int j = 0;
+
+    for (; j + 4 <= nx; j += 4) {
+        double4_t vals = {static_cast<double>(row[j]), static_cast<double>(row[j+1]),
+                          static_cast<double>(row[j+2]), static_cast<double>(row[j+3])};
+        double4_t diff = vals - mean_vec;
+        square_sum_vec += diff * diff;
+    }
+
+    double square_sum = horizontal_sum(square_sum_vec);
+
+    for (; j < nx; ++j) {
+        double diff = static_cast<double>(row[j]) - mean;
+        square_sum += diff * diff;
+    }
+
+    return std::sqrt(square_sum);
+}
+
+static inline double4_t sqrt_vector(double4_t v) {
+    double4_t r = {0.0, 0.0, 0.0, 0.0};
+    for (int i = 0; i < 4; ++i) {
+        r[i] = std::sqrt(v[i]);
+    }
+    return r;
+}
+
+static inline double4_t swap2(double4_t x) { return _mm256_permute2f128_pd(x, x, 0b00000001); }
+static inline double4_t swap1(double4_t x) { return _mm256_permute_pd(x, 0b00000101); }
+
+void correlate(int ny, int nx, const float *data, float *result) {
+    //int nb = 4;
+
+    constexpr int blockCols = 4;
+    constexpr int blockRows = 8;
+
+    const int vecCols = (nx + blockCols - 1) / blockCols;
+    const int vecRows = (ny + blockRows - 1) / blockRows;
+    const int paddedRows = vecRows * blockRows;
+
+    //double4_t* vector_data = static_cast<double4_t*>(_mm_malloc(sizeof(double4_t) * na * nx, 32));
+    std::vector<double4_t> vd(paddedRows * vecCols);
+    
+    #pragma omp parallel for
+    for (int y = 0; y < paddedRows; y++) {
+        for (int x = 0; x < vecCols; x++) {
+            for (int v = 0; v < blockCols; v++) {
+                int col = x * blockCols + v;
+                vd[y * vecCols + x][v] = (col < nx && y < ny) ? data[y * nx + col] : 0;
+            }
+        }
+    }
+
+
+    #pragma omp parallel for
+    for (int row = 0; row < ny; row++) {
+        double4_t sumVec = {0.0, 0.0, 0.0, 0.0};
+    
+        // Sum all vector blocks in this row
+        for (int colBlock = 0; colBlock < vecCols; colBlock++) {
+            sumVec = sumVec + vd[row * vecCols + colBlock];
+        }
+    
+        // Horizontal sum to get scalar row sum
+        double totalSum = 0.0;
+        for (int i = 0; i < 4; i++) {
+            totalSum += sumVec[i];
+        }
+    
+        // Compute mean and subtract from row
+        double rowMean = totalSum / nx;
+        double4_t meanVec = {rowMean, rowMean, rowMean, rowMean};
+    
+        for (int colBlock = 0; colBlock < vecCols; colBlock++) {
+            vd[row * vecCols + colBlock] -= meanVec;
+        }
+    
+        // Zero out padding after mean subtraction
+        for (int v = 1; v < 4; v++) {
+            if (4 * (vecCols - 1) + v >= nx) {
+                vd[(vecCols - 1) + row * vecCols][v] = 0;
+            }
+        }
+    
+        // Compute sum of squares
+        double4_t squareSumVec = d4zero;
+        for (int colBlock = 0; colBlock < vecCols; colBlock++) {
+            double4_t val = vd[row * vecCols + colBlock];
+            squareSumVec += val * val;
+        }
+    
+        double totalSquareSum = 0.0;
+        for (int i = 0; i < 4; i++) {
+            totalSquareSum += squareSumVec[i];
+        }
+    
+        // Normalize row
+        double4_t normFactorInput = {totalSquareSum, totalSquareSum, totalSquareSum, totalSquareSum};
+        double4_t normFactor = sqrt_vector(normFactorInput);
+        for (int colBlock = 0; colBlock < vecCols; colBlock++) {
+            vd[row * vecCols + colBlock] /= normFactor;
+        }
+    
+        // Final padding cleanup
+        for (int v = 1; v < 4; v++) {
+            if (4 * (vecCols - 1) + v >= nx) {
+                vd[(vecCols - 1) + row * vecCols][v] = 0;
+            }
+        }
+    }
+
+    
+    #pragma omp parallel for schedule(dynamic)
+    for (int ia = 0; ia < vecRows; ++ia) {
+        for (int ja = ia; ja < vecRows; ++ja) {
+            double4_t acc[8] = {d4zero, d4zero, d4zero, d4zero,
+                                d4zero, d4zero, d4zero, d4zero};
+
+            for (int k = 0; k < vecCols; ++k) {
+                // Calculate correct indices for accessing vector data
+                int a_base_idx = ia * blockRows * vecCols;
+                int b_base_idx = ja * blockRows * vecCols;
+                
+                // Process blocks in rows ia and ja, column k
+                for (int block_row_offset = 0; block_row_offset < blockRows; block_row_offset += blockCols) {
+                    // Load vector data for 4 rows at a time
+                    double4_t a = vd[a_base_idx + block_row_offset * vecCols + k];
+                    double4_t b = vd[b_base_idx + block_row_offset * vecCols + k];
+                    
+                    // Generate permutations
+                    double4_t a_sw2 = swap2(a);
+                    double4_t b_sw1 = swap1(b);
+                    
+                    // Accumulate dot products with permutations
+                    acc[0 + block_row_offset / blockCols] += a * b;
+                    acc[1 + block_row_offset / blockCols] += a * b_sw1;
+                    acc[2 + block_row_offset / blockCols] += a_sw2 * b;
+                    acc[3 + block_row_offset / blockCols] += a_sw2 * b_sw1;
+                }
+            }
+                    
+
+            acc[1] = swap1(acc[1]);
+            acc[3] = swap1(acc[3]);
+            acc[5] = swap1(acc[5]);
+            acc[7] = swap1(acc[7]);
+
+            for (int jb = 0; jb < blockCols; ++jb) {
+                for (int ib = 0; ib < blockRows; ++ib) {
+                    int i = ib + blockRows * ia;
+                    int j = jb + blockRows * ja;
+
+                    if (j < ny && i < ny && i <= j) {
+                        result[i * ny + j] = acc[ib ^ jb][jb];
+                    }
+                }
+            }
+        }
+    }
+
+    //_mm_free(vector_data);
+}
